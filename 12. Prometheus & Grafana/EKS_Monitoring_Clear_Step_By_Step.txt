@@ -1,0 +1,514 @@
+EKS MONITORING SETUP – DETAILED STEP-BY-STEP GUIDE
+===================================================
+
+This document explains EACH STEP clearly with: 
+- What we are doing 
+- Why we are doing it 
+- What to verify
+
+----------------------------------------------------------------
+ARCHITECTURE OVERVIEW (EXPLAIN FIRST)
+----------------------------------------------------------------
+We are setting up monitoring in Amazon EKS using:
+
+1. Node Exporter → Collects node CPU, memory, disk metrics 
+2. Prometheus → Scrapes and stores metrics, evaluates alerts 
+3. Alertmanager → Sends alert notifications (Email) 
+4. Grafana →   Displays metrics as dashboards
+
+FLOW: Node Exporter → Prometheus → Alertmanager → Email → Grafana (Visualization)
+----------------------------------------------------------------
+
+PREREQUISITES
+==============
+
+1. Amazon EKS cluster must be running
+2. kubectl must be configured
+3. You must have access to the cluster
+4. Verify cluster access: kubectl get nodes
+5. You should see worker nodes in Ready state.
+
+================================================================ 
+STEP 1: CREATE A MONITORING NAMESPACE
+================================================================ 
+
+WHAT: Create a separate namespace called “monitoring”.
+
+WHY: 
+- Keeps monitoring components separate from applications 
+- Easy management and troubleshooting
+
+COMMAND: kubectl create namespace monitoring
+
+VERIFY: kubectl get namespaces
+
+You should see: monitoring
+
+================================================================
+STEP 2:SETUP NODE EXPORTER (NODE METRICS)
+================================================================
+
+WHAT IS NODE EXPORTER? 
+Node Exporter collects hardware-level metrics from each worker node such as CPU usage, memory usage, disk usage, and network usage.
+
+WHY DO WE NEED IT? 
+- Prometheus cannot directly read node metrics. 
+- Node Exporter exposes these metrics on port 9100.
+
+---------------------------------------------------------------
+STEP 2.1: CREATE NODE EXPORTER DAEMONSET
+---------------------------------------------------------------
+WHAT: Deploy Node Exporter as a DaemonSet.
+
+WHY DAEMONSET? 
+- Ensures ONE pod runs on EACH worker node automatically 
+- New nodes get Node Exporter automatically
+
+node-exporter-daemonset.yaml
+=============================
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+  namespace: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: node-exporter
+  template:
+    metadata:
+      labels:
+        app: node-exporter
+    spec:
+      containers:
+      - name: node-exporter
+        image: prom/node-exporter
+        ports:
+        - containerPort: 9100
+
+Apply: kubectl apply -f node-exporter-daemonset.yaml
+
+VERIFY AFTER APPLY: kubectl get pods -n monitoring
+
+You should see one node-exporter pod per node.
+
+---------------------------------------------------------------
+STEP 2.2: CREATE NODE EXPORTER SERVICE (MANDATORY)
+---------------------------------------------------------------
+WHAT: Create a Kubernetes Service for Node Exporter.
+
+WHY SERVICE IS REQUIRED: 
+- Pods have dynamic IP addresses 
+- Prometheus needs a stable endpoint 
+- Service provides DNS and load balancing
+
+node-exporter-service.yaml
+===========================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-exporter
+  namespace: monitoring
+spec:
+  selector:
+    app: node-exporter
+  ports:
+  - port: 9100
+    targetPort: 9100
+
+
+Apply: kubectl apply -f node-exporter-service.yaml
+
+
+SERVICE DNS NAME: node-exporter.monitoring.svc.cluster.local:9100
+
+VERIFY: kubectl get svc -n monitoring
+
+You should see: node-exporter ClusterIP 9100/TCP
+
+IMPORTANT RULE: DaemonSet does NOT create a Service automatically.
+
+================================================================ 
+STEP 3: SETUP PROMETHEUS
+================================================================
+
+WHAT IS PROMETHEUS? 
+Prometheus is a monitoring system that: 
+- Scrapes metrics from targets 
+- Stores metrics in a time-series database 
+- Evaluates alert rules
+
+---------------------------------------------------------------
+STEP 3.1: CREATE PROMETHEUS CONFIGMAP
+---------------------------------------------------------------
+WHAT: Create a ConfigMap containing prometheus.yml.
+
+WHY: 
+Prometheus needs configuration to know: 
+- How often to scrape 
+- Which targets to scrape
+
+prometheus-config.yaml
+=======================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+
+    scrape_configs:
+    - job_name: node-exporter
+      static_configs:
+      - targets:
+        - node-exporter.monitoring.svc.cluster.local:9100
+
+Apply: kubectl apply -f prometheus-config.yaml
+
+
+TARGET CONFIGURED: 
+node-exporter.monitoring.svc.cluster.local:9100
+  
+---------------------------------------------------------------
+STEP 3.2: CREATE PROMETHEUS DEPLOYMENT
+---------------------------------------------------------------
+WHAT: Deploy Prometheus as a Deployment.
+
+WHY DEPLOYMENT? 
+- Ensures Prometheus pod stays running 
+- Allows restart if pod crashes
+
+Prometheus reads configuration from ConfigMap.
+
+prometheus-deployment.yaml
+===========================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      containers:
+      - name: prometheus
+        image: prom/prometheus
+        args:
+          - "--config.file=/etc/prometheus/prometheus.yml"
+        ports:
+        - containerPort: 9090
+        volumeMounts:
+        - name: config
+          mountPath: /etc/prometheus
+      volumes:
+      - name: config
+        configMap:
+          name: prometheus-config
+
+
+Apply: kubectl apply -f prometheus-deployment.yaml
+
+VERIFY: kubectl get pods -n monitoring
+
+Prometheus pod should be Running.
+
+------------------------------------------------------------------
+STEP 3.3: CREATE PROMETHEUS SERVICE
+------------------------------------------------------------------
+WHAT: Create a Service for Prometheus.
+
+WHY: 
+- Required for internal communication 
+- Required for port-forwarding and UI access
+
+prometheus-service.yaml
+========================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  type: LoadBalancer
+  ports:
+    - port: 9090
+      targetPort: 9090
+  selector:
+    app: prometheus
+
+
+Apply: kubectl apply -f prometheus-service.yaml
+
+VERIFY: kubectl get svc -n monitoring
+
+================================================================
+STEP 4: SETUP ALERTMANAGER
+================================================================
+
+WHAT IS ALERTMANAGER? 
+Alertmanager receives alerts from Prometheus and sends notifications such as Email, Slack, or Teams.
+
+------------------------------------------------------------------
+STEP 4.1: CREATE ALERTMANAGER CONFIGMAP
+------------------------------------------------------------------
+WHAT: Create ConfigMap containing alertmanager.yml.
+
+WHY: 
+Defines: 
+- SMTP server details 
+- Sender email 
+- Receiver email
+
+alertmanager-config.yaml
+=========================
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: monitoring
+data:
+  alertmanager.yml: |
+    global:
+      smtp_smarthost: smtp.gmail.com:587
+      smtp_from: yourmail@gmail.com
+      smtp_auth_username: yourmail@gmail.com
+      smtp_auth_password: APP_PASSWORD
+
+    route:
+      receiver: email-alert
+
+    receivers:
+    - name: email-alert
+      email_configs:
+      - to: team@gmail.com
+        send_resolved: true
+
+
+Apply: kubectl apply -f alertmanager-config.yaml
+
+IMPORTANT: Use Gmail App Password (not your actual password).
+
+---------------------------------------------------------------
+STEP 4.2: CREATE ALERTMANAGER DEPLOYMENT
+---------------------------------------------------------------
+WHAT: Deploy Alertmanager as a Deployment.
+
+WHY: Ensures Alertmanager runs continuously and reloads config.
+
+alertmanager-deployment.yaml
+=============================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alertmanager
+  template:
+    metadata:
+      labels:
+        app: alertmanager
+    spec:
+      containers:
+      - name: alertmanager
+        image: prom/alertmanager
+        args:
+          - "--config.file=/etc/alertmanager/alertmanager.yml"
+        ports:
+        - containerPort: 9093
+        volumeMounts:
+        - name: config
+          mountPath: /etc/alertmanager
+      volumes:
+      - name: config
+        configMap:
+          name: alertmanager-config
+
+Apply: kubectl apply -f alertmanager-deployment.yaml
+
+VERIFY: kubectl get pods -n monitoring
+
+---------------------------------------------------------------
+STEP 4.3: CREATE ALERTMANAGER SERVICE
+---------------------------------------------------------------
+WHAT: Create Service to expose Alertmanager.
+
+PORT USED: 9093
+
+WHY: 
+- Required for Prometheus communication 
+- Required to access Alertmanager UI
+
+alertmanager-service.yaml
+==========================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  namespace: monitoring
+spec:
+  type: LoadBalancer
+  ports:
+    - port: 9093
+      targetPort: 9093
+  selector:
+    app: alertmanager
+
+
+Apply: kubectl apply -f alertmanager-service.yaml
+
+================================================================
+STEP 5: SETUP GRAFANA
+================================================================
+
+WHAT IS GRAFANA? 
+Grafana is a visualization tool that converts metrics into graphs, charts, and dashboards.
+
+---------------------------------------------------------------
+STEP 5.1: CREATE GRAFANA DEPLOYMENT
+---------------------------------------------------------------
+WHAT: Deploy Grafana.
+
+PORT: 3000
+
+grafana-deployment.yaml
+========================
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      containers:
+      - name: grafana
+        image: grafana/grafana
+        ports:
+        - containerPort: 3000
+
+Apply: kubectl apply -f grafana-deployment.yaml
+
+---------------------------------------------------------------
+STEP 5.2: CREATE GRAFANA SERVICE
+---------------------------------------------------------------
+WHAT: Create Service for Grafana.
+
+WHY: Allows UI access and port-forwarding.
+
+grafana-service.yaml
+=====================
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  type: LoadBalancer
+  ports:
+    - port: 3000
+      targetPort: 3000
+  selector:
+    app: grafana
+
+
+Apply: kubectl apply -f grafana-service.yaml
+
+================================================================ 
+STEP 6: ACCESS COMPONENTS IN BROWSER (EKS)
+================================================================
+
+What happens?
+- Kubernetes creates an AWS Load Balancer
+- Prometheus is exposed using a public DNS name
+- No kubectl port-forward needed
+
+---------------------------------------------------------------
+ACCESS PROMETHEUS
+---------------------------------------------------------------
+kubectl get svc -n monitoring Prometheus
+
+Browser: http://a1b2c3d4.elb.amazonaws.com:9090
+
+---------------------------------------------------------------
+ACCESS ALERTMANAGER
+---------------------------------------------------------------
+
+kubectl get svc -n monitoring alertmanager
+
+Browser: http://a1b2c3d4.elb.amazonaws.com:9093
+
+---------------------------------------------------------------
+ACCESS GRAFANA
+---------------------------------------------------------------
+
+kubectl get svc -n monitoring grafana 
+
+Browser: http://a1b2c3d4.elb.amazonaws.com:3000
+
+Login: Username: admin Password: admin
+
+NOTE: Port forwarding works only while terminal is open.
+
+================================================================ 
+STEP 7: CONFIGURE GRAFANA
+================================================================
+
+1.  Login to Grafana
+2.  Go to Settings → Data Sources
+3.  Add Prometheus
+4.  URL: http://prometheus.monitoring.svc.cluster.local:9090
+5.  Save & Test
+
+IMPORT DASHBOARD: Dashboard ID: 1860 (Node Exporter Full)
+
+================================================================ 
+STEP 8: VALIDATION CHECKS
+================================================================
+
+Prometheus: Status → Targets node-exporter must be UP
+
+Grafana: Dashboard should show CPU, memory, disk metrics
+
+================================================================
+IMPORTANT RULES FOR FRESHERS
+================================================================ 
+1. Pods change IPs – Services provide stability 
+2. DaemonSet does NOT create Service 
+3. Prometheus scrapes Services, not pods 
+4. Port-forwarding is temporary 
+5. LoadBalancer and Ingress are advanced topics
+
+================================================================ 
+                    END OF DOCUMENT
+================================================================
