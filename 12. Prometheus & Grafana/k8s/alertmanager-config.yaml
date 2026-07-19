@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: monitoring
+data:
+  alertmanager.yml: |
+    global:
+      smtp_smarthost: smtp.gmail.com:587
+      smtp_from: shashivardhan0406@gmail.com
+      smtp_auth_username: shashivardhan0406@gmail.com
+      smtp_auth_password: gkta zlkz aswx fyjk
+
+    route:
+      receiver: email-alert
+
+    receivers:
+    - name: email-alert
+      email_configs:
+      - to: shashivardhan04@gmail.com
+        send_resolved: true
